@@ -6,6 +6,10 @@ import torch
 from functools import partial
 from contextlib import nullcontext
 import inspect
+import zeus
+from zeus.optimizer.pipeline_frequency import PipelineFrequencyOptimizer
+from PFO.monkey import instrument_megatron
+from megatron.core.utils import get_model_config
 
 from typing import List, Optional, Tuple, Union
 from megatron.training import get_args
@@ -36,8 +40,83 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
 )
 
-
+# Straggler detector
 stimer = StragglerDetector()
+
+# Pipeline Frequency Optimizer
+pfo_initialized = False
+
+import torch.distributed as dist
+
+class DummyPipelineFrequencyOptimizer:
+    """A no-op version of PipelineFrequencyOptimizer that does not hit any server."""
+
+    def __init__(
+        self,
+        rank: int,
+        dp_rank: int,
+        pp_rank: int,
+        tp_rank: int,
+        device_id: int,
+        dp_degree: int,
+        pp_degree: int,
+        tp_degree: int,
+        world_size: int,
+        server_url: str,      # We'll ignore this
+        job_metadata: str|None = None,
+    ) -> None:
+        # ----------------------------
+        # 1) Store whatever you need
+        # ----------------------------
+        self.rank = rank
+        self.dp_rank = dp_rank
+        self.pp_rank = pp_rank
+        self.tp_rank = tp_rank
+        self.device_id = device_id
+        self.dp_degree = dp_degree
+        self.pp_degree = pp_degree
+        self.tp_degree = tp_degree
+        self.world_size = world_size
+        self.server_url = server_url       # No-op usage
+        self.job_metadata = job_metadata
+
+        # ----------------------------
+        # 2) Fake the server logic
+        # ----------------------------
+        # For example, you might store a dummy job_id and skip actual registration:
+        self.job_id = "dummy_job_id"
+
+        # If your pipeline hooks rely on the "frequency_controller" existing, 
+        # you can either create a real one or a fake one. Let's do a trivial stub:
+        self.frequency_controller = None
+
+        # If your pipeline code calls "self._get_frequency_schedule()" or 
+        # references "self.freq_schedule", define it here:
+        self.freq_schedule = []
+        self.freq_schedule_iter = iter(self.freq_schedule)
+
+        print(f"[DummyPipelineFrequencyOptimizer] Initialized on rank={rank} with NO server calls.")
+
+    # ---------------------------------
+    # 3) Implement or override methods
+    # ---------------------------------
+    def on_step_begin(self):
+        """Called at the start of each pipeline 'step'."""
+        # do nothing (or your test logic)
+        print(f"[DummyPFO rank={self.rank}] on_step_begin called")
+
+    def on_instruction_begin(self, stage_name: str):
+        """Called at the start of each forward/backward instruction."""
+        print(f"[DummyPFO rank={self.rank}] on_instruction_begin: {stage_name}")
+
+    def on_instruction_end(self, stage_name: str):
+        """Called at the end of each forward/backward instruction."""
+        print(f"[DummyPFO rank={self.rank}] on_instruction_end: {stage_name}")
+
+    def on_step_end(self):
+        """Called at the end of each pipeline 'step'."""
+        print(f"[DummyPFO rank={self.rank}] on_step_end called")
+
 
 def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
@@ -52,6 +131,7 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
     Returns:
         Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
+    global pfo_initialized
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
 
@@ -127,6 +207,57 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
                 rotary_base=args.rotary_base,
                 rope_scaling=args.use_rope_scaling
             )
+
+    if not pfo_initialized:
+        pass
+        # job_metadata = args.model_type
+        # "+".join([
+        #     args.model_type,
+        #     # args.train_schedule,
+        #     # f"mbs{args.micro_batch_size}",
+        #     # f"nmb{args.gradient_accumulation_steps}",
+        # ])
+
+        # pfo = PipelineFrequencyOptimizer(
+        #     rank=torch.distributed.get_rank(),
+        #     dp_rank=mpu.get_data_parallel_rank(),  # utils.py has mpu.get_data_parallel_rank, and mpu = parallel_state, which is defined in parallel_state.py at Megatron/Core 
+        #     pp_rank=mpu.get_pipeline_model_parallel_rank(),
+        #     tp_rank=mpu.get_expert_tensor_parallel_rank(), # Cant find slice parallel rank !!!! but there is get_pipeline_model_split_parallel_rank
+        #     device_id=torch.cuda.current_device(),
+        #     dp_degree=mpu.get_data_parallel_world_size(),
+        #     pp_degree=mpu.get_pipeline_model_parallel_world_size(),
+        #     tp_degree=mpu.get_expert_tensor_parallel_world_size(),
+        #     world_size=torch.distributed.get_world_size(),
+        #     server_url=args.pfo_server_url,
+        #     job_metadata=None,
+        # )
+
+        pfo = DummyPipelineFrequencyOptimizer(
+            rank=torch.distributed.get_rank(),
+            dp_rank=mpu.get_data_parallel_rank(),
+            pp_rank=mpu.get_pipeline_model_parallel_rank(),
+            tp_rank=mpu.get_expert_tensor_parallel_rank(),
+            device_id=torch.cuda.current_device(),
+            dp_degree=mpu.get_data_parallel_world_size(),
+            pp_degree=mpu.get_pipeline_model_parallel_world_size(),
+            tp_degree=mpu.get_expert_tensor_parallel_world_size(),
+            world_size=torch.distributed.get_world_size(),
+            server_url="http://fake-url",
+            job_metadata=None,
+        )
+
+        instrument_megatron(pfo)
+        pfo_initialized = True
+        print_rank_0(
+            f"PFO initialized - DP{pfo.dp_rank} PP{pfo.pp_rank} TP{pfo.tp_rank} "
+            f"on device {pfo.device_id}"
+        )
+        
+        # Get the Megatron config object for the newly created model
+        config = get_model_config(model)
+
+        # Attach pfo as a field on the config
+        config.pfo = pfo
 
     return model
 
@@ -233,7 +364,7 @@ def forward_step(data_iterator, model: GPTModel):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
             data_iterator)
     timers('batch-generator').stop()
-
+    # Where to put on_step_begin() and end????
     with stimer:
         output_tensor = model(tokens, position_ids, attention_mask,
                               labels=labels)
@@ -303,7 +434,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 
 if __name__ == "__main__":
-
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 

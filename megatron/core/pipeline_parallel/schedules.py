@@ -18,6 +18,7 @@ from megatron.core.utils import (
     get_model_type,
     get_model_xattn,
 )
+from zeus.optimizer.pipeline_frequency import PipelineFrequencyOptimizer
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -1737,6 +1738,8 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        config.pfo.on_step_begin()
+
         input_tensor = recv_forward(recv_tensor_shapes, config)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -1858,6 +1861,8 @@ def forward_backward_pipelining_without_interleaving(
             )
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
+            
+            config.pfo.on_step_end()
 
         # Launch any remaining grad reductions.
         if no_sync_context is not None:
